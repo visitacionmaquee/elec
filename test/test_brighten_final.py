@@ -5,8 +5,9 @@ import pytest
 import sys
 import os
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
-exec(open("../src/brighten_final.py").read())
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from brighten_final import apply_clahe
 
 def test_apply_clahe():
     """Test CLAHE function"""
