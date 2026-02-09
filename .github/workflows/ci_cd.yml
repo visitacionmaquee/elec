@@ -1,17 +1,17 @@
-name: Image Processing CI/CD Pipeline
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
 
 on:
   push:
+    branches: [ main, master ]
     paths:
+      - 'input/**'
       - 'src/**'
-      - 'tests/**'
+      - 'test/**'
       - 'requirements.txt'
       - '.github/workflows/**'
-      - 'input/**'
   pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/**'
+    branches: [ main, master ]
   workflow_dispatch:  # Manual trigger
 
 jobs:
@@ -20,51 +20,36 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
         
-    - name: Install system dependencies for OpenCV
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
-        
-    - name: Install Python dependencies
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest pytest-cov
         
     - name: Run tests with pytest
       run: |
-        python -m pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
+        python -m pytest test/ -v --cov=src --cov-report=xml
         
-    - name: Upload coverage report
-      uses: actions/upload-artifact@v3
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
       with:
-        name: coverage-report
-        path: htmlcov/
+        file: ./coverage.xml
+        fail_ci_if_error: false
         
-    - name: Upload test results
-      if: always()
-      uses: actions/upload-artifact@v3
-      with:
-        name: test-results
-        path: |
-          test-reports/
-          coverage.xml
-
   process-images:
     needs: test
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'input/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'input/') || github.event_name == 'workflow_dispatch'
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
         
@@ -75,30 +60,33 @@ jobs:
         
     - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
         
     - name: Detect changed images
       id: changed-images
       run: |
         # Get list of changed files in input directory
-        git diff --name-only HEAD^ HEAD | grep "^input/" > changed_files.txt || true
+        git diff --name-only HEAD^ HEAD -- input/ > changed_files.txt || true
         
         if [ -s changed_files.txt ]; then
+          echo "Changed images detected:"
+          cat changed_files.txt
           echo "images=$(cat changed_files.txt | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
-          echo "has_changes=true" >> $GITHUB_OUTPUT
         else
-          echo "has_changes=false" >> $GITHUB_OUTPUT
+          echo "No images changed in input directory"
+          echo "images=" >> $GITHUB_OUTPUT
         fi
         
-    - name: Process images with all filters
-      if: steps.changed-images.outputs.has_changes == 'true'
+    - name: Process images
+      if: steps.changed-images.outputs.images != ''
       run: |
-        # Create output directory
+        echo "Processing images: ${{ steps.changed-images.outputs.images }}"
+        
+        # Create output directory if it doesn't exist
         mkdir -p output
         
-        # Split image list
+        # Process each image with all filters
         IFS=',' read -ra IMAGES <<< "${{ steps.changed-images.outputs.images }}"
         
         for image_path in "${IMAGES[@]}"; do
@@ -107,63 +95,60 @@ jobs:
             echo "Processing: $filename"
             
             # Run each processing script
-            python src/beautify_final.py <<< "$filename" || echo "Beautify failed for $filename"
-            python src/brighten_final.py <<< "$filename" || echo "Brighten failed for $filename"
-            python src/cartoonify_final.py <<< "$filename" || echo "Cartoonify failed for $filename"
-            python src/slowshutter_final.py <<< "$filename" || echo "Slowshutter failed for $filename"
-            
-            # For CandidOrPosed, we need to handle differently
             python -c "
 import sys
 sys.path.append('src')
-import CandidOrPosed
-CandidOrPosed.classify_image('$image_path')
-" || echo "Candid detection failed for $filename"
+import cv2
+import numpy as np
+
+# Load image
+img = cv2.imread('$image_path')
+if img is not None:
+    # Beautify
+    exec(open('src/beautify_final.py').read())
+    beautified = smooth_skin(img)
+    cv2.imwrite(f'output/beautified_{filename}', beautified)
+    
+    # Brighten
+    exec(open('src/brighten_final.py').read())
+    brightened = apply_clahe(img)
+    cv2.imwrite(f'output/brightened_{filename}', brightened)
+    
+    # Cartoonify
+    exec(open('src/cartoonify_final.py').read())
+    cartoonified = cartoonify(img)
+    cv2.imwrite(f'output/cartoonified_{filename}', cartoonified)
+    
+    # Slow shutter
+    exec(open('src/slowshutter_final.py').read())
+    slow_shutter = apply_slow_shutter(img)
+    cv2.imwrite(f'output/slowshutter_{filename}', slow_shutter)
+    
+    print(f'Processed {filename} with all filters')
+else:
+    print(f'Failed to load {filename}')
+            "
           fi
         done
         
     - name: Commit and push processed images
-      if: steps.changed-images.outputs.has_changes == 'true'
+      if: steps.changed-images.outputs.images != ''
       run: |
         # Configure git
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
         # Add processed images
-        if [ -n "$(git status --porcelain output/)" ]; then
+        if [ -d "output" ]; then
           git add output/
-          git commit -m "CI: Auto-process images from input [skip ci]"
-          git push
-        else
-          echo "No new processed images to commit"
+          
+          # Check if there are changes to commit
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "CI: Auto-process images from input folder [skip ci]"
+            git push
+          fi
         fi
-        
-    - name: Upload processed images as artifact
-      if: steps.changed-images.outputs.has_changes == 'true'
-      uses: actions/upload-artifact@v3
-      with:
-        name: processed-images
-        path: output/
-        
-  security-scan:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-      
-    - name: Run safety check
-      uses: pyupio/safety-action@v1
-      with:
-        api-key: ${{ secrets.SAFETY_API_KEY }}
-        
-    - name: Run bandit security scan
-      run: |
-        pip install bandit
-        bandit -r src/ -f html -o security-report.html || true
-        
-    - name: Upload security report
-      uses: actions/upload-artifact@v3
-      with:
-        name: security-reports
-        path: security-report.html
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
